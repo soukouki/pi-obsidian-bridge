@@ -1,43 +1,11 @@
 #!/usr/bin/env python3
 """
-Hermes Obsidian Bridge
-------------------------
-Obsidianのノート内に記述された `@Hermes` のようなタグを検出し、別マシン上で動作する
-Hermes Agent ゲートウェイ(HTTP API)にリクエストを送り、結果をノートに
-書き戻すデーモン。
+Pi Obsidian Bridge
 
-検出は inotify (Linux) を使ったイベント駆動で、数千ファイル規模でも
-ポーリングなしで軽量に動作する。
+Obsidianノート内の `@PI` タグを検出し、Pi (pi-web) にリクエストを送り、
+結果をcalloutとしてノートに書き戻すデーモン。検出は inotify (Linux) 使用。
 
-処理の流れ:
-    1. ノート内で未処理のタグを検出
-    2. 直後を "@<Tag>👀<!-- hermes-id:XXXX -->" に即座に書き換え、
-       その段落の直後に「実行中」callout(id付き)を挿入する
-       (この書き換え自体もinotifyイベントを発火させるが、マーカーが
-        付いているため再検出されず、二重処理を防げる)
-    3. 該当行の段落 + 前後の段落を抽出し、build_prompt() でプロンプトを
-       組み立ててHermesゲートウェイの POST /v1/runs に送信
-    4. 実行中は GET /v1/runs/{run_id}/events (SSE) を裏で購読し、
-       thinking(reasoning)やtool呼び出しの様子を蓄積する。
-       ただし更新しすぎるとファイルが荒れるため、PROGRESS_UPDATE_INTERVAL秒
-       ごとに、その時点までの経過を「実行中」calloutに追記していく
-    5. 最終結果が返ってきたら "@<Tag>👀..." を "@<Tag>✅️..." に置き換え、
-       「実行中」callout(thinkingの内容)をまるごと最終結果のcalloutで
-       上書きする(thinkingの跡は残さない)
-    6. エラー時は "@<Tag>⚠️..." にし、手動で "@<Tag>" に戻せば再試行可能
-
-依存:
-    pip install inotify_simple requests --break-system-packages
-
-前提:
-    - Linux上でボルトファイルシステムに直接アクセスできること(inotifyは
-      Linux専用のため)。macOSの場合はfswatch等への置き換えが必要。
-    - Hermesゲートウェイが起動しており、VPN越しにHTTP到達できること。
-    - Hermesゲートウェイのconfig.yamlでAPIサーバーが有効化され、
-      API_SERVER_KEYが設定されていること。
-    - Hermesゲートウェイが GET /v1/runs/{run_id}/events (SSE) を
-      提供していること(進捗表示に使用。取得できない場合でも最終結果の
-      取得自体は GET /v1/runs/{run_id} のポーリングで独立して動作する)。
+依存: requests, inotify_simple, websocket-client, pyyaml
 """
 
 from __future__ import annotations
@@ -55,6 +23,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import requests
+import websocket
 import yaml
 from inotify_simple import INotify, flags
 
@@ -64,8 +33,9 @@ from inotify_simple import INotify, flags
 # ============================================================
 
 VAULT_DIR = Path(os.getenv("VAULT_DIR", "/vault"))
-HERMES_BASE = os.getenv("HERMES_BASE", "http://localhost:8642")
-API_KEY = os.getenv("API_KEY", "api_server_key")
+PI_BASE = os.getenv("PI_BASE", "http://localhost:8504").rstrip("/")
+# Piから見て存在する絶対パスである必要がある(保管庫のパスではない)
+PI_CWD = os.getenv("PI_CWD", "/workspace")
 
 EMOJI_SEEN = "👀"     # 処理開始
 EMOJI_DONE = "✅️"     # 処理完了
@@ -74,25 +44,21 @@ EMOJI_ERROR = "⚠️"    # エラー(手動でトリガータグに書き戻せ
 # 監視・スキャンから除外するディレクトリ名
 EXCLUDE_DIRS = {".git", ".obsidian", ".trash", "node_modules"}
 
-# Hermesへの同時リクエスト数上限
+# Piへの同時リクエスト数上限(=同時セッション数)
 MAX_WORKERS = 4
 
-# 1回のHermes呼び出しの完了確認ポーリング間隔・タイムアウト(秒)
-# ※これは「1リクエストの完了待ち」のポーリングであり、
-#   ボルト内のファイル変更検出自体はinotifyでイベント駆動のため
-#   ポーリングは発生しない。
+# 1リクエストの完了待ちポーリング(ファイル検出はinotifyでイベント駆動)
 POLL_INTERVAL = 2
 POLL_TIMEOUT = 600
 
-# 実行中callout(thinking/tool呼び出しの経過)をノートに書き戻す間隔(秒)。
-# 短くしすぎるとファイルの書き換えが頻発してうるさくなるので注意。
+# 実行中calloutの書き戻し間隔(秒)
 PROGRESS_UPDATE_INTERVAL = 15
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
 )
-log = logging.getLogger("hermes-watcher")
+log = logging.getLogger("pi-watcher")
 
 # ============================================================
 # エージェント設定
@@ -103,8 +69,9 @@ class AgentConfig:
     """config.yaml から読み込む1エージェントの設定。"""
     tag: str
     aliases: tuple[str, ...]
-    model: str | None
+    model: str | None  # "provider/model-id" または model-id 単独
     provider: str # default: "auto"
+    thinking: str | None
     front: str
     back: str
 
@@ -151,9 +118,7 @@ def load_config() -> list[AgentConfig]:
     agents: list[AgentConfig] = []
     default_alias_holder: str | None = None
 
-    # default セクションから front/back を補間
     def _interp(s: str) -> str:
-        # config.yaml の default.front では {note_title} は補間しない
         return s
 
     for tag, cfg in agents_data.items():
@@ -164,30 +129,31 @@ def load_config() -> list[AgentConfig]:
         aliases = tuple(cfg.get("aliases") or [])
         model = cfg.get("model")
         provider = cfg.get("provider") or "auto"
+        thinking = cfg.get("thinking")
         agents.append(AgentConfig(
             tag=tag,
             aliases=aliases,
             model=model,
             provider=provider,
+            thinking=thinking,
             front=front,
             back=back,
         ))
-        # @Hermes エイリアスを持つエージェントをデフォルトとする
-        if "@Hermes" in aliases and default_alias_holder is None:
+        if "@PI" in aliases and default_alias_holder is None:
             default_alias_holder = tag
 
-    # デフォルト設定
     if not agents:
-        return _default_agents(), "@Hermes"
+        return _default_agents()
 
     return agents
 
 def _default_agents() -> list[AgentConfig]:
     return [AgentConfig(
-        tag="@Hermes",
+        tag="@PI",
         aliases=(),
         model=None,
         provider="auto",
+        thinking=None,
         front=DEFAULT_FRONT,
         back=DEFAULT_BACK,
     )]
@@ -205,9 +171,8 @@ for _a in _AGENTS:
         _ALL_TRIGGERS.add(_alias)
         _TAG_TO_AGENT[_alias] = _a
 
-# @<Tag>　のような生タグを検出 (すべての登録済みユーザー対象)
-# ただしすでにマーカー付き (👀/✅️/⚠️) のものは除外
-_MARKER_PREFIX = f"<!-- hermes"
+# 生の @<Tag> を検出(マーカー付きのものは除外)
+_MARKER_PREFIX = f"<!-- pi"
 _TRIBUTE_PATTERN = r"(?<!@)(" + "|".join(re.escape(t) for t in _ALL_TRIGGERS) + r")"
 TRIGGER_RE = re.compile(
     _TRIBUTE_PATTERN + r"(?![👀✅⚠️])"
@@ -217,14 +182,13 @@ TRIGGER_RE = re.compile(
 def seen_marker_re(tag: str, request_id: str) -> re.Pattern:
     """処理中マーカー(IDつき)を探すための正規表現。"""
     return re.compile(
-        re.escape(f"{tag}{EMOJI_SEEN}<!-- hermes-id:{request_id} -->")
+        re.escape(f"{tag}{EMOJI_SEEN}<!-- pi-id:{request_id} -->")
     )
 
 
-# 実行中calloutを識別するためのIDコメント。
-# calloutの本文側にHTMLコメントとしてIDを埋め込む(プレビュー表示では見えない)。
+# 実行中calloutを識別するためのIDコメント(プレビューでは非表示)
 def progress_id_comment(request_id: str) -> str:
-    return f"<!-- hermes-progress-id:{request_id} -->"
+    return f"<!-- pi-progress-id:{request_id} -->"
 
 
 def progress_callout_re(request_id: str) -> re.Pattern:
@@ -261,15 +225,8 @@ HEADING_RE = re.compile(r"^#{1,6}\s")
 
 
 def split_paragraphs(text: str) -> list[tuple[int, int, str]]:
-    """
-    空行区切りで段落のリストを作る。各要素は (start, end, content)。
-
-    加えて、見出し行(`# ...` 形式のATX見出し)は、前後に空行がなく本文と
-    地続きになっていても、見出し単独で1段落として切り出す。これにより
-    「見出しの直後に本文が続く」ようなケースでも、見出しと本文の間に
-    自然な段落の隙間ができ、@<Tag>の直後に何かを挿入する際にその隙間を
-    使えるようになる。
-    """
+    """空行区切りで段落を (start, end, content) として列挙する。
+    見出し行は前後に空行がなくても単独で1段落として切り出す。"""
     paragraphs: list[tuple[int, int, str]] = []
     for m in re.finditer(r"[^\n]+(?:\n(?!\s*\n)[^\n]*)*", text):
         block_start = m.start()
@@ -303,12 +260,8 @@ def split_paragraphs(text: str) -> list[tuple[int, int, str]]:
 def extract_context(
     text: str, match_start: int, match_end: int
 ) -> tuple[list[str] | None, str, list[str] | None]:
-    """
-    @<Tag>が含まれる段落、およびその前方数段落、後方数段落を取得する。
-    前方は最小3段落で、多くて3000文字に収まる段落数。
-    後方は最小1段落で、多くて1000文字に収まる段落数。
-    戻り値: (前段落 or None, 対象段落, 次段落 or None)
-    """
+    """(前段落 or None, 対象段落, 次段落 or None)。
+    前:最小3段落/3000字、後:最小1段落/1000字。"""
     paragraphs = split_paragraphs(text)
     target_idx = None
     for i, (s, e, _) in enumerate(paragraphs):
@@ -351,7 +304,6 @@ def extract_context(
 
 def extract_user_request(target_paragraph: str) -> str:
     """対象段落から @<Tag> 以降のユーザー要望テキストを取り出す。"""
-    # Match any registered trigger tag
     for tag in _ALL_TRIGGERS:
         idx = target_paragraph.find(tag)
         if idx != -1:
@@ -366,10 +318,7 @@ def build_prompt(
     target_paragraph: str,
     next_paragraphs: list[str] | None,
 ) -> str:
-    """
-    Hermesに渡す最終的な指示文を組み立てる。
-    config.yaml の front/back を補間し、前後の段落を文脈として渡す。
-    """
+    """config.yaml の front/back を補間して最終指示文を組み立てる。"""
     parts = [agent.front.replace("{note_title}", note_title), ""]
     if prev_paragraphs:
         parts += ["--- 前方の段落 ---", *prev_paragraphs, ""]
@@ -384,10 +333,7 @@ def build_prompt(
 # Markdownエスケープ
 # ============================================================
 
-# calloutの本文中に差し込む動的な文字列(ツール名・引数プレビュー・
-# thinkingの抜粋など)に含まれるMarkdown特殊文字をエスケープする。
-# 例えば引数に `*` や `#` が入っていると、callout内で強調や見出しとして
-# 解釈されて見た目が崩れるため。
+# callout本文に差し込む文字列のMarkdown特殊文字をエスケープする
 _MD_ESCAPE_RE = re.compile(r"([\\`*_{}\[\]()#+\-.!>~|])")
 
 
@@ -400,15 +346,9 @@ def escape_markdown(text: str) -> str:
 # ============================================================
 # トリガー文字列のサニタイズ
 # ============================================================
-#
-# LLMの出力(思考経過の抜粋や最終結果)に「@Hermes」のような生の文字列が
-# 含まれてしまうと、それがノート内で `TRIGGER_RE` にヒットし、
-# 新しい未処理タスクとして再検知されてしまい、無限ループが発生する。
-# サニタイズにより、LLMが吐いたタグに衝突するものには即座に `✅️` マークを付けて
-# から書き込み、以降のスキャンで検出されないようにする。
-# `✅️` は完了マーカーなので、仮に再検知されても意味論的にはヒッツに
-# ならず安全に無視される(`TRIGGER_RE` はヒットしない)。
-# `TRIGGER_RE` と同じ否定先頭枠守を使って生の `@<Tag>` だけを抽出する。
+# LLM出力に生の @<Tag> が含まれていると `TRIGGER_RE` に再ヒットして
+# 無限ループになるため、書き込み時に完了マークを付けて中立化する。
+# 以降のスキャンでは無視される。
 _SANITIZE_TRIGGER_RE = re.compile(
     _TRIBUTE_PATTERN + r"(?![👀✅⚠️])"
 )
@@ -425,17 +365,15 @@ def sanitize_trigger(text: str) -> str:
 # ============================================================
 
 class RunActivity:
-    """
-    GET /v1/runs/{run_id}/events (SSE) から届くイベントを蓄積し、
-    「実行中」calloutに表示する行のリストを組み立てるためのクラス。
-    複数スレッド(SSE受信スレッドとcallout更新スレッド)から
-    アクセスされるためロックで保護する。
-    """
+    """WebSocketフレームから「実行中」calloutの行を組み立てる。
+    受信スレッドと更新スレッドからアクセスされるためロックで保護する。"""
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._lines: list[str] = []
-        self._current_tool: str | None = None
+        # deltaフレームは断片で届くためstreamIdごとにバッファする
+        self._buffers: dict[str, str] = {}
+        self._last_label: str | None = None
         self._dirty = False
 
     def _add(self, line: str) -> None:
@@ -443,134 +381,106 @@ class RunActivity:
             self._lines.append(line)
             self._dirty = True
 
-    @staticmethod
-    def _extract_tool_name(data: dict, fallback: str | None) -> str:
-        """
-        ツール名のフィールド名はHermesのバージョン/エンドポイントによって
-        揺れる(tool_name, name, toolName, tool.name, ...)ため、
-        考えられる候補を順に見ていく。どれも見つからない場合のみ
-        "tool"(不明)にフォールバックする。
-        """
-        candidates = (
-            data.get("tool_name")
-            or data.get("toolName")
-            or data.get("name")
-            or data.get("tool")
-            or data.get("function_name")
-            or data.get("functionName")
-        )
-        if isinstance(candidates, dict):
-            candidates = (
-                candidates.get("name")
-                or candidates.get("tool_name")
-                or candidates.get("toolName")
-            )
-        if isinstance(candidates, str) and candidates.strip():
-            return candidates.strip()
-        return fallback or "tool"
+    def handle_frame(self, frame: dict) -> None:
+        """フレーム1件を処理する。ツールは名のみ表示し、最終回答は書かない
+        (最終結果側でcalloutを上書きするため重複表示になる)。"""
+        ftype = frame.get("type")
 
-    def handle_event(self, event_type: str | None, data: dict) -> None:
-        """
-        SSEイベント1件を処理する。Hermesのバージョンによってフィールド名が
-        揺れる可能性があるため、複数のキー名をフォールバックで見る。
-        ツール呼び出しの引数・プレビューは(長い/記号が多いと読みづらいため)
-        表示せず、ツール名のみを表示する。
-        """
-        event_type = event_type or data.get("type") or data.get("event")
-
-        if event_type in ("reasoning.available", "reasoning.delta", "reasoning"):
-            preview = (
-                data.get("preview") or data.get("delta")
-                or data.get("text") or data.get("message") or ""
-            ).strip()
-            if preview:
-                # thinkingのプレビューは複数行になることがある。callout内では
-                # 全ての行が`>`始まりでなければ表示が崩れるため、1行ずつ
-                # 独立したエントリとして追加する(build_progress_callout側で
-                # 各エントリに`> `を付けるため、ここでは改行を残さない)。
-                escaped = escape_markdown(preview)
-                escaped = sanitize_trigger(escaped)
-                sub_lines = [ln for ln in escaped.splitlines() if ln.strip()]
-                for i, ln in enumerate(sub_lines):
-                    prefix = "🧠" if i == 0 else "  "
-                    self._add(f"{prefix} {ln}")
-
-        elif event_type in ("tool.started", "tool_call.started"):
-            tool = self._extract_tool_name(data, None)
-            self._current_tool = tool
-            self._add(f"🔧 {sanitize_trigger(escape_markdown(tool))} を実行中...")
-
-        elif event_type in ("tool.completed", "tool_call.completed"):
-            tool = self._extract_tool_name(data, self._current_tool)
-            self._add(f"✅ {sanitize_trigger(escape_markdown(tool))} 完了")
-
-        elif event_type in ("tool.failed", "tool_call.failed"):
-            tool = self._extract_tool_name(data, self._current_tool)
-            self._add(f"⚠️ {sanitize_trigger(escape_markdown(tool))} 失敗")
-
-        elif event_type in ("run.started",):
+        if ftype == "agent.start":
             self._add("🚀 実行を開始しました")
 
-        # それ以外のイベント種別(run.completed等)は最終結果側で扱うため無視する
+        elif ftype == "activity.update":
+            label = ((frame.get("activity") or {}).get("label") or "").strip()
+            # 繰り返し届くため変化分だけ表示する
+            if label and label != self._last_label:
+                self._last_label = label
+                self._add(f"📌 {sanitize_trigger(escape_markdown(label))}")
+
+        elif ftype == "assistant.thinking.delta":
+            stream_id = frame.get("streamId") or "_"
+            text = frame.get("text") or ""
+            if not text:
+                return
+            with self._lock:
+                buf = self._buffers.get(stream_id, "") + text
+                parts = buf.split("\n")
+                for part in parts[:-1]:
+                    if part.strip():
+                        self._lines.append(f"🧠 {sanitize_trigger(escape_markdown(part))}")
+                self._buffers[stream_id] = parts[-1]
+                self._dirty = True
+
+        elif ftype == "tool.start":
+            tool = frame.get("toolName") or "tool"
+            self._add(f"🔧 {sanitize_trigger(escape_markdown(tool))} を実行中...")
+
+        elif ftype == "tool.end":
+            tool = frame.get("toolName") or "tool"
+            mark = "⚠️" if frame.get("isError") else "✅"
+            self._add(f"{mark} {sanitize_trigger(escape_markdown(tool))} 完了")
+
+        elif ftype == "message.end":
+            message = frame.get("message") or {}
+            if message.get("role") != "assistant":
+                return
+            # 改行で確定しなかった末尾の断片を1行として確定する
+            stream_id = frame.get("streamId") or message.get("streamId") or "_"
+            with self._lock:
+                rest = self._buffers.pop(stream_id, "").strip()
+                if rest:
+                    self._lines.append(f"🧠 {sanitize_trigger(escape_markdown(rest))}")
+                    self._dirty = True
 
     def snapshot(self) -> list[str]:
         with self._lock:
             return list(self._lines)
 
     def pop_dirty(self) -> bool:
-        """前回のcallout更新以降に新しい行が追加されたかどうかを返し、フラグを下ろす。"""
+        """前回更新以降に新しい行が追加されたかを返し、フラグを下ろす。"""
         with self._lock:
             was_dirty = self._dirty
             self._dirty = False
             return was_dirty
 
 
-def stream_run_progress(run_id: str, activity: RunActivity, stop_event: threading.Event) -> None:
-    """
-    GET /v1/runs/{run_id}/events をSSEで購読し、届いたイベントを
-    activityに書き込み続ける。接続が切れる/取得できない場合は静かに諦める
-    (進捗表示が更新されないだけで、最終結果の取得は別途ポーリングで行う)。
-    """
-    headers = {"Authorization": f"Bearer {API_KEY}", "Accept": "text/event-stream"}
-    url = f"{HERMES_BASE}/v1/runs/{run_id}/events"
+def stream_pi_progress(session_id: str, activity: RunActivity, stop_event: threading.Event) -> None:
+    """WebSocketでフレームをactivityに書き込み続ける。
+    接続できない/切れた場合は静かに諦める(結果取得はポーリング側で行う)。"""
+    url = f"{PI_BASE}/api/machines/local/sessions/{session_id}/events"
     try:
-        with requests.get(url, headers=headers, stream=True, timeout=(10, POLL_TIMEOUT)) as r:
-            r.raise_for_status()
-            event_type: str | None = None
-            for raw_line in r.iter_lines(decode_unicode=True):
-                if stop_event.is_set():
-                    return
-                if raw_line is None:
-                    continue
-                line = raw_line.rstrip("\r")
-                if line == "":
-                    event_type = None
-                    continue
-                if line.startswith(":"):
-                    continue  # keep-alive / コメント行
-                if line.startswith("event:"):
-                    event_type = line[len("event:"):].strip()
-                    continue
-                if line.startswith("data:"):
-                    data_str = line[len("data:"):].strip()
-                    try:
-                        data = json.loads(data_str)
-                    except ValueError:
-                        continue
-                    activity.handle_event(event_type, data)
+        ws = websocket.create_connection(url, timeout=10)
     except Exception:
-        log.debug("SSE購読を終了しました run_id=%s", run_id, exc_info=True)
+        log.debug("WebSocket接続に失敗しました session_id=%s", session_id, exc_info=True)
+        return
+    try:
+        while not stop_event.is_set():
+            try:
+                ws.settimeout(5)
+                raw = ws.recv()
+            except websocket.WebSocketTimeoutException:
+                continue
+            except Exception:
+                break  # 切断
+            if not raw:
+                continue
+            try:
+                frame = json.loads(raw)
+            except ValueError:
+                continue
+            activity.handle_frame(frame)
+    except Exception:
+        log.debug("WebSocket購読を終了しました session_id=%s", session_id, exc_info=True)
+    finally:
+        try:
+            ws.close()
+        except Exception:
+            pass
 
 
 def run_progress_updater(
     path: Path, request_id: str, activity: RunActivity, done_event: threading.Event
 ) -> None:
-    """
-    PROGRESS_UPDATE_INTERVAL秒ごとに、activityに新しい行が溜まっていれば
-    「実行中」calloutに反映する。done_eventがセットされたら終了する
-    (完了時の最終上書きはworker側のinsert_resultが行うため、ここでは
-    何もしない)。
-    """
+    """新しい行が溜まっていれば「実行中」calloutに反映する。"""
     while True:
         if done_event.wait(PROGRESS_UPDATE_INTERVAL):
             return
@@ -582,31 +492,77 @@ def run_progress_updater(
 
 
 # ============================================================
-# Hermes API 呼び出し
+# Pi API 呼び出し
 # ============================================================
 
-def call_hermes_api(prompt: str, model: str | None, provider: str, activity: RunActivity) -> str:
-    headers = {"Authorization": f"Bearer {API_KEY}"}
-
-    # POST /v1/runs のレスポンスは {"run_id": "...", "status": "started"}
-    # model フィールドは PR #54426 パッチ適用後に有効
-    body: dict = {"input": prompt, "provider": provider}
-    if model:
-        body["model"] = model
-    r = requests.post(
-        f"{HERMES_BASE}/v1/runs",
-        json=body,
-        headers=headers,
-        timeout=30,
-    )
+def _api_post(path: str, body: dict) -> dict:
+    r = requests.post(f"{PI_BASE}{path}", json=body, timeout=30)
     r.raise_for_status()
-    run_id = r.json()["run_id"]
+    return r.json()
 
-    # 実行中の様子(thinking/tool呼び出し)をバックグラウンドで拾い続ける
+
+def _api_get(path: str, params: dict) -> dict:
+    r = requests.get(f"{PI_BASE}{path}", params=params, timeout=30)
+    r.raise_for_status()
+    return r.json()
+
+
+# pending / toolUse は途中のターンなので最終結果ではない
+_TERMINAL_STOP_REASONS = {"stop", "length", "error", "aborted"}
+
+
+def extract_final_text(messages: dict) -> str | None:
+    """text blockだけを結合して最終assistant回答を取り出す。途中ならNone。"""
+    last: dict | None = None
+    for msg in messages.get("messages") or []:
+        if msg.get("role") == "assistant" and msg.get("stopReason") in _TERMINAL_STOP_REASONS:
+            last = msg
+    if last is None:
+        return None
+    if last.get("stopReason") in ("error", "aborted"):
+        raise RuntimeError(last.get("errorMessage") or f"run {last.get('stopReason')}")
+    parts = [
+        c.get("text") for c in (last.get("content") or [])
+        if c.get("type") == "text" and c.get("text")
+    ]
+    return "\n".join(parts).strip() or None
+
+
+def call_pi_api(prompt: str, agent: AgentConfig, activity: RunActivity) -> str:
+    """リクエストごとに新しいセッションを作り、プロンプトを送って最終結果を返す。"""
+    session_id = _api_post("/api/machines/local/sessions", {"cwd": PI_CWD})["id"]
+
+    model = agent.model
+    provider = agent.provider
+    if model and "/" in model:
+        provider, model = model.split("/", 1)
+    # 設定値が不正でもリクエスト全体を失敗させないよう、警告して続行する
+    if model and provider and provider != "auto":
+        try:
+            _api_post(
+                f"/api/machines/local/sessions/{session_id}/model",
+                {"cwd": PI_CWD, "provider": provider, "modelId": model},
+            )
+        except Exception as e:
+            log.warning("モデル固定に失敗しました session_id=%s: %s", session_id, e)
+    if agent.thinking:
+        try:
+            _api_post(
+                f"/api/machines/local/sessions/{session_id}/thinking-level",
+                {"cwd": PI_CWD, "level": agent.thinking},
+            )
+        except Exception as e:
+            log.warning("thinkingレベル設定に失敗しました session_id=%s: %s", session_id, e)
+
+    _api_post(
+        f"/api/machines/local/sessions/{session_id}/prompt",
+        {"cwd": PI_CWD, "text": prompt},
+    )
+
     stop_stream = threading.Event()
     stream_thread = threading.Thread(
-        target=stream_run_progress,
-        args=(run_id, activity, stop_stream),
+        target=stream_pi_progress,
+        args=(session_id, activity, stop_stream),
         daemon=True,
     )
     stream_thread.start()
@@ -614,42 +570,29 @@ def call_hermes_api(prompt: str, model: str | None, provider: str, activity: Run
     try:
         deadline = time.time() + POLL_TIMEOUT
         while time.time() < deadline:
-            sr = requests.get(
-                f"{HERMES_BASE}/v1/runs/{run_id}",
-                headers=headers,
-                timeout=30,
+            answer = extract_final_text(
+                _api_get(
+                    f"/api/machines/local/sessions/{session_id}/messages",
+                    {"cwd": PI_CWD, "limit": 50},
+                )
             )
-            sr.raise_for_status()
-            data = sr.json()
-            status = data.get("status")
-
-            if status == "completed":
-                return (data.get("output") or "").strip()
-            if status in ("failed", "cancelled"):
-                raise RuntimeError(data.get("error") or f"run {status}")
-
+            if answer is not None:
+                return answer
             time.sleep(POLL_INTERVAL)
 
-        raise TimeoutError("Hermesからの応答がタイムアウトしました")
+        raise TimeoutError("Piからの応答がタイムアウトしました")
     finally:
         stop_stream.set()
         stream_thread.join(timeout=5)
 
 
-# calloutのタイトル行(`[!note]`, `[!warning]-` など)を検出する正規表現。
-# `>` を剥がした後の文字列に対してマッチさせる。
+# calloutタイトル行(`[!note]` 等)を、`>` を剥がした文字列に対して検出する
 _CALLOUT_HEADER_RE = re.compile(r"^\[![a-zA-Z][a-zA-Z0-9_-]*\][+-]?.*$")
 
 
 def strip_wrapping_callout(text: str) -> str:
-    """
-    LLMの出力が、直前のcalloutの見た目に引っ張られるなどして丸ごと
-    callout形式(`> [!note]\\n> ...`)で返ってきてしまうことがある。
-    そのまま既存のcalloutに詰めるとcalloutの中にcalloutがネストして
-    表示が崩れるため、出力の先頭がcallout形式であれば、その引用を
-    1段階だけ剥がしてプレーンなテキストに戻す。calloutでなければ
-    そのまま返す。
-    """
+    """出力がcallout形式で返ってきた場合、引用を1段階剥がしてプレーンな
+    テキストに戻す。callout内calloutは表示が崩れるため。"""
     if not text:
         return text
     lines = text.split("\n")
@@ -665,13 +608,13 @@ def strip_wrapping_callout(text: str) -> str:
         return text
     header_body = first[1:].strip()
     if not _CALLOUT_HEADER_RE.match(header_body):
-        return text  # 単なる引用(`>`)であってcalloutではない場合は触らない
+        return text
 
     rest = lines[start + 1:]
     non_empty = [l for l in rest if l.strip() != ""]
     quoted = [l for l in non_empty if l.lstrip().startswith(">")]
     if non_empty and len(quoted) < len(non_empty) * 0.8:
-        return text  # 大半の行が`>`で始まっていない場合はcalloutと見なさない
+        return text
 
     dequoted: list[str] = []
     for line in rest:
@@ -692,12 +635,8 @@ def strip_wrapping_callout(text: str) -> str:
 # ============================================================
 
 def build_progress_callout(request_id: str, lines: list[str]) -> str:
-    """
-    「実行中」calloutのMarkdown断片(タイトル行を含む)を組み立てる。
-    タイトル行には既に [!example] のマークが付いているため絵文字は追加せず、
-    IDはHTMLコメントとして本文1行目に埋め込む(プレビューでは非表示)。
-    """
-    header = "> [!example] Hermes 実行中...\n"
+    """「実行中」calloutのMarkdown断片(タイトル行を含む)を組み立てる。"""
+    header = "> [!example] Pi 実行中...\n"
     id_line = f"> {progress_id_comment(request_id)}\n"
     body = "\n".join(f"> {line}" for line in (lines or ["⏳ 準備中..."]))
     return header + id_line + body + "\n"
@@ -721,7 +660,7 @@ def mark_seen(path: Path) -> tuple[str, str, str, str] | None:
     """
     ファイル内の最初の未処理 @<Tag> を見つけ、👀マーカーに即座に置き換えて
     書き込む。同時に、その段落の直後に「実行中」calloutを挿入する。
-    戻り値: (request_id, prompt, model, tag) または 未検出ならNone。
+    戻り値: (request_id, prompt, agent, tag) または 未検出ならNone。
     """
     lock = get_file_lock(str(path))
     with lock:
@@ -730,18 +669,16 @@ def mark_seen(path: Path) -> tuple[str, str, str, str] | None:
         if not m:
             return None
 
-        # マッチしたタグから対応する AgentConfig を解決
-        matched_tag = m.group(1)  # re キャプチャで取得
+        matched_tag = m.group(1)
         agent = _TAG_TO_AGENT.get(matched_tag)
         if agent is None:
-            # フォールバック: デフォルトエージェント
             agent = _AGENTS[0]
             matched_tag = agent.tag
         log.info("未処理トリガーを検出: tag=%s file=%s", matched_tag, path)
 
         prev_p, target_p, next_p = extract_context(text, m.start(), m.end())
         request_id = uuid.uuid4().hex[:8]
-        marker = f"{agent.tag}{EMOJI_SEEN}<!-- hermes-id:{request_id} -->"
+        marker = f"{agent.tag}{EMOJI_SEEN}<!-- pi-id:{request_id} -->"
 
         paragraphs = split_paragraphs(text)
         target_idx = next(
@@ -769,29 +706,24 @@ def mark_seen(path: Path) -> tuple[str, str, str, str] | None:
             target_paragraph=target_p,
             next_paragraphs=next_p,
         )
-        return request_id, prompt, agent.model, agent.provider, agent.tag
+        return request_id, prompt, agent, matched_tag
 
 
 def insert_result(path: Path, request_id: str, tag: str, result_text: str, error: bool = False) -> None:
-    """
-    対応するトリガーマーカーを✅️(エラー時は⚠️)に置き換え、
-    「実行中」calloutをまるごと最終結果のcalloutで上書きする
-    (thinking等の途中経過は残さない)。
-    """
+    """マーカーを完了/エラーの絵文字に置き換え、「実行中」calloutを
+    最終結果のcalloutで上書きする(途中経過は残さない)。"""
     lock = get_file_lock(str(path))
     with lock:
         text = path.read_text(encoding="utf-8")
 
-        # 1. トリガーマーカーを完了/エラーの絵文字に置き換え
         sm = seen_marker_re(tag, request_id).search(text)
         final_emoji = EMOJI_ERROR if error else EMOJI_DONE
         if sm:
-            replaced_marker = f"{tag}{final_emoji}<!-- hermes-id:{request_id} -->"
+            replaced_marker = f"{tag}{final_emoji}<!-- pi-id:{request_id} -->"
             text = text[: sm.start()] + replaced_marker + text[sm.end():]
         else:
             log.warning("トリガーマーカーが見つかりません: id=%s path=%s", request_id, path)
 
-        # 2. 「実行中」calloutを最終結果のcalloutで上書き
         callout_type = "error" if error else "note"
         if not error:
             result_text = strip_wrapping_callout(result_text)
@@ -807,7 +739,6 @@ def insert_result(path: Path, request_id: str, tag: str, result_text: str, error
         if pm:
             text = text[: pm.start()] + final_callout + text[pm.end():]
         else:
-            # 進捗calloutが見つからない場合は、マーカー直後の段落末尾に新規追加する
             paragraphs = split_paragraphs(text)
             anchor = sm.start() if sm else 0
             target_idx = next(
@@ -838,7 +769,7 @@ def process_file(path: Path) -> None:
     if result is None:
         return  # 未処理のトリガーなし
 
-    request_id, prompt, model, provider, tag = result
+    request_id, prompt, agent, tag = result
     log.info("処理開始 id=%s file=%s tag=%s", request_id, path, tag)
 
     def worker() -> None:
@@ -851,11 +782,11 @@ def process_file(path: Path) -> None:
         )
         updater_thread.start()
         try:
-            answer = call_hermes_api(prompt, model, provider, activity)
+            answer = call_pi_api(prompt, agent, activity)
             insert_result(path, request_id, tag, answer, error=False)
             log.info("処理完了 id=%s file=%s", request_id, path)
         except Exception as e:
-            log.exception("Hermes呼び出しに失敗しました id=%s", request_id)
+            log.exception("Pi呼び出しに失敗しました id=%s", request_id)
             insert_result(path, request_id, tag, f"エラーが発生しました: {e}", error=True)
         finally:
             done_event.set()

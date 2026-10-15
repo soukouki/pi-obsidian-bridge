@@ -1,6 +1,9 @@
 
 default: &default
-  provider: custom
+  # Piのprovider。モデルは "provider/model-id" の形でも書ける
+  provider: llama
+  # thinking: off / minimal / low / medium / high / xhigh / max
+  # 省略すればPi側の既定値(modelごとにmax等)が使われる
   front: |
     あなたはObsidianのノート「{note_title}」内で呼び出されたアシスタントです。
     以下はそのノートの該当箇所の抜粋です。
@@ -17,6 +20,7 @@ agents:
   "@Heavy":
     <<: *default
     model: gemma-4-31b-mtp
+    thinking: high
     back: |
       上記の文脈を踏まえて、必要であれば検索やプログラム実行などを行った上で、聞かれたことについてミニレポートを日本語で書いてください。関連する情報はしっかりと探してください。
       ObsidianのMCPツールを用いてこのノートや関連する他のノートを参照(閲覧)してください。ただし、このノート自体を編集・書き換えるツールは使わないでください。
@@ -26,20 +30,21 @@ agents:
       絶対に「結果はこのとおりです」「以下Markdown形式で回答します」「```markdown」などの前置き文は書かないでください。
       コールアウトの引用は自動で付与されるので不要です。
 
-  "@Hermes":
+  "@PI":
     <<: *default
     aliases: ["@Normal"]
     model: gemma-4-31b-mtp
+    thinking: medium
 
   "@Light":
     <<: *default
     model: gemma-4-26b-a4b
-    provider: custom
+    thinking: low
 
   "@Search":
     <<: *default
-    model: gemma-4-26b-a4b
-    provider: custom
+    model: qwen3.8-flash-next
+    thinking: low
     front: |
       あなたはObsidianのノート「{note_title}」内で呼び出された検索アシスタントです。
       以下はそのノートの該当箇所の抜粋です。

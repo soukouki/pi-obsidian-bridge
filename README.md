@@ -1,40 +1,41 @@
 # hermes-obsidian-bridge
 
-## Hermes APIについて
+Obsidianのノート内の `@PI` タグを検出し、Pi ([pi-web](https://github.com/jmfederico/pi-web)) にリクエストを送り、結果を callout としてノートに書き戻すデーモンです。
 
-`config.yaml` にて `provider` と `model` を指定できるようになっていますが、2026-07-23現在の最新版のHermesにおいて、この機能は動作しません。動作させるには、 [feat(api): honor provider-aware request routing by abundantbeing · Pull Request #54426 · NousResearch/hermes-agent · GitHub](https://github.com/NousResearch/hermes-agent/pull/54426) の変更を取り込む必要があります。
+## pi-webについて
 
-具体的には、hermes-gateway側のDockerfile等にて以下のコマンドを実行する必要があります。また、今後のHermesの更新によって動作しなくなる可能性もあります。
-```sh
-RUN curl -o \
-    /opt/hermes/gateway/platforms/api_server.py \
-    https://raw.githubusercontent.com/abundantbeing/hermes-agent/731e52fb67a525f92396bbf9c1e1704b5fedd9be/gateway/platforms/api_server.py
-```
+ここで使う `pi-web` は [jmfederico/pi-web](https://github.com/jmfederico/pi-web)
+(Pi Coding AgentのWeb UI)です。同名かつ似た役割のより広く知られたプロジェクト(agegr/pi-web)や、別のPI AgentをWebから扱うためのプロジェクトとは別物です。
+
+pi-web の HTTP API を使います。認証は不要です。
+
+`cwd` は単なる文字列パラメータです。プロジェクトの登録やID管理は不要ですが、**Piから見て存在する絶対パス**である必要があります。保管庫のパスではありません。Piは保管庫にアクセスできないため、文脈はプロンプト内の抜粋のみで渡します。
 
 ## `compose.yml`の設定例
 
-gatewayと同じnetworkで動作させる必要があります。
+pi-web の**公式Dockerイメージは公開されていません**。
+
+pi-web の既定のバインドは `127.0.0.1` なので、別コンテナから到達するには `0.0.0.0` で
+リッスンさせる(またはポートを公開する)必要があります。
 
 ```compose.yml
 services:
-  hermes-gateway:
-    image: nousresearch/hermes-agent:latest
-    restart: unless-stopped
-    command: gateway run
-
+  # pi-web側は各自の導入方法(npmまたは docker/install.sh)で起動したものとします
   hermes-obsidian:
     build:
-      context: ./hermes-obsidian
+      context: .
       dockerfile: Dockerfile
     restart: unless-stopped
-    network_mode: "service:hermes-gateway"
-    depends_on:
-      - hermes-gateway
     volumes:
-      - ./hermes-obsidian:/app
       - ${OBSIDIAN_VAULT}:/vault
     environment:
       - VAULT_DIR=/vault
-      - HERMES_BASE=http://localhost:8642
-      - API_KEY=${HERMES_API_SERVER_KEY}
+      - PI_BASE=http://pi:8504   # pi-webに到達できるURL(同じネットワークならサービス名)
+      - PI_CWD=/workspace        # Pi側で存在する絶対パス
+```
+
+## 依存
+
+```sh
+pip install requests inotify_simple websocket-client pyyaml
 ```
