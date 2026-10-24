@@ -96,22 +96,30 @@ DEFAULT_BACK = (
 
 CONFIG_PATH = Path(os.getenv("CONFIG_PATH", str(Path(__file__).parent / "config.yaml")))
 
-def load_config() -> list[AgentConfig]:
+# 既定エージェントを示すエイリアス。default_agent が未指定のとき、これを持つエージェントが既定になる
+DEFAULT_ALIAS = "@PI"
+
+def load_config() -> tuple[list[AgentConfig], AgentConfig]:
     """
     config.yaml からエージェント設定を読み込む。
 
-    戻り値: エージェントリスト (優先度順: 明示的 @ タグ > エイリアス)
+    戻り値: (エージェントリスト, 既定エージェント)
+    優先度順: 明示的 @ タグ > エイリアス
+    既定エージェントは default_agent で指定した名前(agents のキーまたは aliases の値)。
+    未指定なら DEFAULT_ALIAS を持つエージェントが使われる。
     """
     if not CONFIG_PATH.exists():
         log.warning("config.yaml が見つかりません: %s (デフォルト設定を使用)", CONFIG_PATH)
-        return _default_agents()
+        agents = _default_agents()
+        return agents, agents[0]
 
     try:
         with open(CONFIG_PATH, encoding="utf-8") as f:
             raw = yaml.safe_load(f)
     except Exception:
         log.exception("config.yaml の解析に失敗しました: %s (デフォルト設定を使用)", CONFIG_PATH)
-        return _default_agents()
+        agents = _default_agents()
+        return agents, agents[0]
 
     agents_data = raw.get("agents") or {}
     default_section = raw.get("default") or {}
@@ -119,6 +127,7 @@ def load_config() -> list[AgentConfig]:
     default_back = default_section.get("back") or DEFAULT_BACK
     default_plain = bool(default_section.get("plain_output", False))
     default_cwd = default_section.get("cwd") or PI_CWD
+    default_agent_name = default_section.get("default_agent")
 
     agents: list[AgentConfig] = []
     default_alias_holder: str | None = None
@@ -151,13 +160,34 @@ def load_config() -> list[AgentConfig]:
             plain_output=bool(cfg.get("plain_output", default_plain)),
             cwd=str(cwd) if cwd else None,
         ))
-        if "@PI" in aliases and default_alias_holder is None:
+        if (tag == DEFAULT_ALIAS or DEFAULT_ALIAS in aliases) and default_alias_holder is None:
             default_alias_holder = tag
 
     if not agents:
-        return _default_agents()
+        agents = _default_agents()
+        return agents, agents[0]
 
-    return agents
+    # 既定エージェント: default_agent で指定した名前 > DEFAULT_ALIAS を持つエージェント > 最初のエージェント
+    by_name: dict[str, AgentConfig] = {}
+    for a in agents:
+        by_name[a.tag] = a
+        for alias in a.aliases:
+            by_name[alias] = a
+
+    default_agent: AgentConfig | None = None
+    if default_agent_name:
+        default_agent = by_name.get(str(default_agent_name))
+        if default_agent is None:
+            log.warning(
+                "default_agent が見つかりません: %s (既定エイリアス %s を使用)",
+                default_agent_name, DEFAULT_ALIAS,
+            )
+    if default_agent is None and default_alias_holder is not None:
+        default_agent = by_name[default_alias_holder]
+    if default_agent is None:
+        default_agent = agents[0]
+
+    return agents, default_agent
 
 def _default_agents() -> list[AgentConfig]:
     return [AgentConfig(
@@ -173,7 +203,7 @@ def _default_agents() -> list[AgentConfig]:
     )]
 
 # 設定を1回だけロード (モジュールレベル)
-_AGENTS = load_config()
+_AGENTS, DEFAULT_AGENT = load_config()
 
 # すべてのトリガータグ + エイリアス (検出/サニタイズ対象)
 _ALL_TRIGGERS = set()
@@ -188,8 +218,12 @@ for _a in _AGENTS:
 # 生の @<Tag> を検出(マーカー付きのものは除外)
 _MARKER_PREFIX = f"<!-- pi"
 _TRIBUTE_PATTERN = r"(?<!@)(" + "|".join(re.escape(t) for t in _ALL_TRIGGERS) + r")"
+# タグを書き忘れた `@` は段落の先頭に書かれたものだけ検出する(本文中の孤立した@に反応しないため)
+_BARE_TRIGGER = r"^(?:@(?=\s|$))"
 TRIGGER_RE = re.compile(
-    _TRIBUTE_PATTERN + r"(?![👀✅⚠️])"
+    r"(?<!@)(" + "|".join(sorted((re.escape(t) for t in _ALL_TRIGGERS), key=len, reverse=True)) + r"|" + _BARE_TRIGGER + r")"
+    + r"(?![👀✅⚠️])",
+    re.MULTILINE,
 )
 
 
@@ -677,6 +711,8 @@ def mark_seen(path: Path) -> tuple[str, str, str, str] | None:
     """
     ファイル内の最初の未処理 @<Tag> を見つけ、👀マーカーに即座に置き換えて
     書き込む。同時に、その段落の直後に「実行中」calloutを挿入する。
+    段落の先頭に `@` だけがある場合は既定エージェントが使われ、マーカーには
+    そのエージェントのタグが書かれる。
     戻り値: (request_id, prompt, agent, tag) または 未検出ならNone。
     """
     lock = get_file_lock(str(path))
@@ -689,7 +725,7 @@ def mark_seen(path: Path) -> tuple[str, str, str, str] | None:
         matched_tag = m.group(1)
         agent = _TAG_TO_AGENT.get(matched_tag)
         if agent is None:
-            agent = _AGENTS[0]
+            agent = DEFAULT_AGENT
             matched_tag = agent.tag
         log.info("未処理トリガーを検出: tag=%s file=%s", matched_tag, path)
 
