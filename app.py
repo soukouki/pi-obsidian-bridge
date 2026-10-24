@@ -35,6 +35,7 @@ from inotify_simple import INotify, flags
 VAULT_DIR = Path(os.getenv("VAULT_DIR", "/vault"))
 PI_BASE = os.getenv("PI_BASE", "http://localhost:8504").rstrip("/")
 # Piから見て存在する絶対パスである必要がある(保管庫のパスではない)
+# config.yaml のエージェント側 `cwd` で上書きできる(未設定のものはこれが使われる)
 PI_CWD = os.getenv("PI_CWD", "/workspace")
 
 EMOJI_SEEN = "👀"     # 処理開始
@@ -75,6 +76,7 @@ class AgentConfig:
     front: str
     back: str
     plain_output: bool = False  # 最終結果をcalloutでなく地の文として書き戻す
+    cwd: str | None = None      # Pi側のプロジェクト(作業ディレクトリ)の絶対パス。NoneならPI_CWD
 
 # デフォルト設定(config.yaml が存在しない場合のフォールバック)
 DEFAULT_FRONT = (
@@ -116,6 +118,7 @@ def load_config() -> list[AgentConfig]:
     default_front = default_section.get("front") or DEFAULT_FRONT
     default_back = default_section.get("back") or DEFAULT_BACK
     default_plain = bool(default_section.get("plain_output", False))
+    default_cwd = default_section.get("cwd") or PI_CWD
 
     agents: list[AgentConfig] = []
     default_alias_holder: str | None = None
@@ -132,6 +135,11 @@ def load_config() -> list[AgentConfig]:
         model = cfg.get("model")
         provider = cfg.get("provider") or "auto"
         thinking = cfg.get("thinking")
+        cwd = cfg.get("cwd") or default_cwd
+        # Pi側で存在する絶対パスでないとセッション作成がHTTP 400になる。このコンテナ
+        # からは実在確認できないため、絶対パスかどうかだけ見て警告する。
+        if cwd and not str(cwd).startswith("/"):
+            log.warning("cwdは絶対パスである必要があります: tag=%s cwd=%s", tag, cwd)
         agents.append(AgentConfig(
             tag=tag,
             aliases=aliases,
@@ -141,6 +149,7 @@ def load_config() -> list[AgentConfig]:
             front=front,
             back=back,
             plain_output=bool(cfg.get("plain_output", default_plain)),
+            cwd=str(cwd) if cwd else None,
         ))
         if "@PI" in aliases and default_alias_holder is None:
             default_alias_holder = tag
@@ -160,6 +169,7 @@ def _default_agents() -> list[AgentConfig]:
         front=DEFAULT_FRONT,
         back=DEFAULT_BACK,
         plain_output=False,
+        cwd=None,
     )]
 
 # 設定を1回だけロード (モジュールレベル)
@@ -534,7 +544,10 @@ def extract_final_text(messages: dict) -> str | None:
 
 def call_pi_api(prompt: str, agent: AgentConfig, activity: RunActivity) -> str:
     """リクエストごとに新しいセッションを作り、プロンプトを送って最終結果を返す。"""
-    session_id = _api_post("/api/machines/local/sessions", {"cwd": PI_CWD})["id"]
+    # Pi側のプロジェクト(作業ディレクトリ)。エージェントごとのcwd、未設定ならPI_CWD
+    cwd = agent.cwd or PI_CWD
+    session_id = _api_post("/api/machines/local/sessions", {"cwd": cwd})["id"]
+    log.info("セッションを作成しました id=%s cwd=%s", session_id, cwd)
 
     model = agent.model
     provider = agent.provider
@@ -545,7 +558,7 @@ def call_pi_api(prompt: str, agent: AgentConfig, activity: RunActivity) -> str:
         try:
             _api_post(
                 f"/api/machines/local/sessions/{session_id}/model",
-                {"cwd": PI_CWD, "provider": provider, "modelId": model},
+                {"cwd": cwd, "provider": provider, "modelId": model},
             )
         except Exception as e:
             log.warning("モデル固定に失敗しました session_id=%s: %s", session_id, e)
@@ -553,14 +566,14 @@ def call_pi_api(prompt: str, agent: AgentConfig, activity: RunActivity) -> str:
         try:
             _api_post(
                 f"/api/machines/local/sessions/{session_id}/thinking-level",
-                {"cwd": PI_CWD, "level": agent.thinking},
+                {"cwd": cwd, "level": agent.thinking},
             )
         except Exception as e:
             log.warning("thinkingレベル設定に失敗しました session_id=%s: %s", session_id, e)
 
     _api_post(
         f"/api/machines/local/sessions/{session_id}/prompt",
-        {"cwd": PI_CWD, "text": prompt},
+        {"cwd": cwd, "text": prompt},
     )
 
     stop_stream = threading.Event()
@@ -577,7 +590,7 @@ def call_pi_api(prompt: str, agent: AgentConfig, activity: RunActivity) -> str:
             answer = extract_final_text(
                 _api_get(
                     f"/api/machines/local/sessions/{session_id}/messages",
-                    {"cwd": PI_CWD, "limit": 50},
+                    {"cwd": cwd, "limit": 50},
                 )
             )
             if answer is not None:
