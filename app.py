@@ -218,12 +218,8 @@ for _a in _AGENTS:
 # 生の @<Tag> を検出(マーカー付きのものは除外)
 _MARKER_PREFIX = f"<!-- pi"
 _TRIBUTE_PATTERN = r"(?<!@)(" + "|".join(re.escape(t) for t in _ALL_TRIGGERS) + r")"
-# タグを書き忘れた `@` は段落の先頭に書かれたものだけ検出する(本文中の孤立した@に反応しないため)
-_BARE_TRIGGER = r"^(?:@(?=\s|$))"
 TRIGGER_RE = re.compile(
-    r"(?<!@)(" + "|".join(sorted((re.escape(t) for t in _ALL_TRIGGERS), key=len, reverse=True)) + r"|" + _BARE_TRIGGER + r")"
-    + r"(?![👀✅⚠️])",
-    re.MULTILINE,
+    _TRIBUTE_PATTERN + r"(?![👀✅⚠️])"
 )
 
 
@@ -711,8 +707,6 @@ def mark_seen(path: Path) -> tuple[str, str, str, str] | None:
     """
     ファイル内の最初の未処理 @<Tag> を見つけ、👀マーカーに即座に置き換えて
     書き込む。同時に、その段落の直後に「実行中」calloutを挿入する。
-    段落の先頭に `@` だけがある場合は既定エージェントが使われ、マーカーには
-    そのエージェントのタグが書かれる。
     戻り値: (request_id, prompt, agent, tag) または 未検出ならNone。
     """
     lock = get_file_lock(str(path))
