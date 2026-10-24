@@ -3,7 +3,7 @@
 # ============================================================
 #
 # app.py が読み取るのは agents と default の2つだけである。
-# default に書けるのは front / back / plain_output / cwd の4項目で、
+# default に書けるのは front / back / plain_output / project の4項目で、
 # agents で省略した項目はここから継承される。
 # model / thinking / provider / aliases は default からは継承されないため、
 # 各エージェントに書くか、下の profiles を参照する。
@@ -28,10 +28,9 @@ default:
   # エラー時の書き戻しは視認性のため callout のまま。
   plain_output: false
 
-  # Pi側のプロジェクト(作業ディレクトリ)の絶対パス。Pi側で存在する必要がある。
-  # 保管庫のパスではない。存在しなければセッション作成がHTTP 400になる。
-  # ここを省略すると環境変数 PI_CWD が使われる。
-  cwd: /workspace
+  # Pi側のプロジェクトの絶対パス。Pi側で存在する必要がある。保管庫のパスではない。
+  # 存在しなければセッション作成がHTTP 400になる。ここを省略すると環境変数 PI_PROJECT が使われる。
+  project: /workspace
 
 # model / thinking / provider を1回だけ定義して参照するためのアンカー。
 # ここがアンカーを使う唯一の場所である。app.py はこのセクションそのものを読まない。
@@ -56,7 +55,7 @@ agents:
     <<: *main
     thinking: medium
     # このエージェントだけ Pi 側のプロジェクトを変える例。Pi側に存在するパスにすること。
-    # cwd: /workspace/code
+    # project: /workspace/code
     back: |
       上記の文脈を踏まえて、数値・計算・表が必要な場合はプログラム実行(python等)で実際に求めた上で、結果を簡潔に(目安3〜6行)日本語でまとめてください。
       記憶や推測で数を書かず、実際に計算・確認した結果だけを返してください。コードそのものは返さず、結果と、その根拠にした数値・前提を明記してください。
