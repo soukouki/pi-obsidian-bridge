@@ -96,30 +96,22 @@ DEFAULT_BACK = (
 
 CONFIG_PATH = Path(os.getenv("CONFIG_PATH", str(Path(__file__).parent / "config.yaml")))
 
-# 既定エージェントを示すエイリアス。default_agent が未指定のとき、これを持つエージェントが既定になる
-DEFAULT_ALIAS = "@PI"
-
-def load_config() -> tuple[list[AgentConfig], AgentConfig]:
+def load_config() -> list[AgentConfig]:
     """
     config.yaml からエージェント設定を読み込む。
 
-    戻り値: (エージェントリスト, 既定エージェント)
-    優先度順: 明示的 @ タグ > エイリアス
-    既定エージェントは DEFAULT_ALIAS(@PI)をタグまたは aliases に持つエージェント。
-    見つからない場合は agents の最初のエージェントが使われる。
+    戻り値: エージェントリスト (優先度順: 明示的 @ タグ > エイリアス)
     """
     if not CONFIG_PATH.exists():
         log.warning("config.yaml が見つかりません: %s (デフォルト設定を使用)", CONFIG_PATH)
-        agents = _default_agents()
-        return agents, agents[0]
+        return _default_agents()
 
     try:
         with open(CONFIG_PATH, encoding="utf-8") as f:
             raw = yaml.safe_load(f)
     except Exception:
         log.exception("config.yaml の解析に失敗しました: %s (デフォルト設定を使用)", CONFIG_PATH)
-        agents = _default_agents()
-        return agents, agents[0]
+        return _default_agents()
 
     agents_data = raw.get("agents") or {}
     default_section = raw.get("default") or {}
@@ -129,7 +121,6 @@ def load_config() -> tuple[list[AgentConfig], AgentConfig]:
     default_cwd = default_section.get("cwd") or PI_CWD
 
     agents: list[AgentConfig] = []
-    default_alias_holder: str | None = None
 
     def _interp(s: str) -> str:
         return s
@@ -159,27 +150,11 @@ def load_config() -> tuple[list[AgentConfig], AgentConfig]:
             plain_output=bool(cfg.get("plain_output", default_plain)),
             cwd=str(cwd) if cwd else None,
         ))
-        if (tag == DEFAULT_ALIAS or DEFAULT_ALIAS in aliases) and default_alias_holder is None:
-            default_alias_holder = tag
 
     if not agents:
-        agents = _default_agents()
-        return agents, agents[0]
+        return _default_agents()
 
-    # 既定エージェント: DEFAULT_ALIAS を持つエージェント > 最初のエージェント
-    by_name: dict[str, AgentConfig] = {}
-    for a in agents:
-        by_name[a.tag] = a
-        for alias in a.aliases:
-            by_name[alias] = a
-
-    default_agent: AgentConfig | None = None
-    if default_alias_holder is not None:
-        default_agent = by_name[default_alias_holder]
-    if default_agent is None:
-        default_agent = agents[0]
-
-    return agents, default_agent
+    return agents
 
 def _default_agents() -> list[AgentConfig]:
     return [AgentConfig(
@@ -195,7 +170,7 @@ def _default_agents() -> list[AgentConfig]:
     )]
 
 # 設定を1回だけロード (モジュールレベル)
-_AGENTS, DEFAULT_AGENT = load_config()
+_AGENTS = load_config()
 
 # すべてのトリガータグ + エイリアス (検出/サニタイズ対象)
 _ALL_TRIGGERS = set()
@@ -711,7 +686,8 @@ def mark_seen(path: Path) -> tuple[str, str, str, str] | None:
         matched_tag = m.group(1)
         agent = _TAG_TO_AGENT.get(matched_tag)
         if agent is None:
-            agent = DEFAULT_AGENT
+            # フォールバック: agents の最初のエージェント
+            agent = _AGENTS[0]
             matched_tag = agent.tag
         log.info("未処理トリガーを検出: tag=%s file=%s", matched_tag, path)
 
