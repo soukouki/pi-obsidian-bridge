@@ -74,6 +74,7 @@ class AgentConfig:
     thinking: str | None
     front: str
     back: str
+    plain_output: bool = False  # 最終結果をcalloutでなく地の文として書き戻す
 
 # デフォルト設定(config.yaml が存在しない場合のフォールバック)
 DEFAULT_FRONT = (
@@ -114,6 +115,7 @@ def load_config() -> list[AgentConfig]:
     default_section = raw.get("default") or {}
     default_front = default_section.get("front") or DEFAULT_FRONT
     default_back = default_section.get("back") or DEFAULT_BACK
+    default_plain = bool(default_section.get("plain_output", False))
 
     agents: list[AgentConfig] = []
     default_alias_holder: str | None = None
@@ -138,6 +140,7 @@ def load_config() -> list[AgentConfig]:
             thinking=thinking,
             front=front,
             back=back,
+            plain_output=bool(cfg.get("plain_output", default_plain)),
         ))
         if "@PI" in aliases and default_alias_holder is None:
             default_alias_holder = tag
@@ -156,6 +159,7 @@ def _default_agents() -> list[AgentConfig]:
         thinking=None,
         front=DEFAULT_FRONT,
         back=DEFAULT_BACK,
+        plain_output=False,
     )]
 
 # 設定を1回だけロード (モジュールレベル)
@@ -709,9 +713,13 @@ def mark_seen(path: Path) -> tuple[str, str, str, str] | None:
         return request_id, prompt, agent, matched_tag
 
 
-def insert_result(path: Path, request_id: str, tag: str, result_text: str, error: bool = False) -> None:
+def insert_result(
+    path: Path, request_id: str, tag: str, result_text: str,
+    error: bool = False, plain: bool = False,
+) -> None:
     """マーカーを完了/エラーの絵文字に置き換え、「実行中」calloutを
-    最終結果のcalloutで上書きする(途中経過は残さない)。"""
+    最終結果で上書きする(途中経過は残さない)。
+    plain=True の場合はcalloutではなく地の文(プレーンなMarkdown)として書き戻す。"""
     lock = get_file_lock(str(path))
     with lock:
         text = path.read_text(encoding="utf-8")
@@ -724,20 +732,25 @@ def insert_result(path: Path, request_id: str, tag: str, result_text: str, error
         else:
             log.warning("トリガーマーカーが見つかりません: id=%s path=%s", request_id, path)
 
-        callout_type = "error" if error else "note"
         if not error:
             result_text = strip_wrapping_callout(result_text)
         result_text = sanitize_trigger(result_text)
         body_lines = result_text.splitlines() or [""]
-        final_callout = (
-            "> [!" + callout_type + "]\n"
-            + "\n".join(f"> {line}" for line in body_lines)
-            + "\n"
-        )
+
+        if plain and not error:
+            # 地の文としてそのまま載せる(前後の空行は段落区切りが保たれる)
+            final_block = "\n".join(body_lines) + "\n"
+        else:
+            callout_type = "error" if error else "note"
+            final_block = (
+                "> [!" + callout_type + "]\n"
+                + "\n".join(f"> {line}" for line in body_lines)
+                + "\n"
+            )
 
         pm = progress_callout_re(request_id).search(text)
         if pm:
-            text = text[: pm.start()] + final_callout + text[pm.end():]
+            text = text[: pm.start()] + final_block + text[pm.end():]
         else:
             paragraphs = split_paragraphs(text)
             anchor = sm.start() if sm else 0
@@ -746,9 +759,9 @@ def insert_result(path: Path, request_id: str, tag: str, result_text: str, error
             )
             if target_idx is not None:
                 para_end = paragraphs[target_idx][1]
-                text = text[:para_end] + "\n\n" + final_callout + text[para_end:]
+                text = text[:para_end] + "\n\n" + final_block + text[para_end:]
             else:
-                text = text + "\n\n" + final_callout
+                text = text + "\n\n" + final_block
 
         path.write_text(text, encoding="utf-8")
 
@@ -783,7 +796,7 @@ def process_file(path: Path) -> None:
         updater_thread.start()
         try:
             answer = call_pi_api(prompt, agent, activity)
-            insert_result(path, request_id, tag, answer, error=False)
+            insert_result(path, request_id, tag, answer, error=False, plain=agent.plain_output)
             log.info("処理完了 id=%s file=%s", request_id, path)
         except Exception as e:
             log.exception("Pi呼び出しに失敗しました id=%s", request_id)

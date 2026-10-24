@@ -1,6 +1,9 @@
 
 default: &default
   provider: llama
+  # 最終結果の書き戻し形式: true で地の文(プレーンなMarkdown), false でcallout
+  # エージェント側で上書きできる(例: plain_output: true)
+  plain_output: false
 
 models:
   main: &m_main
@@ -43,10 +46,29 @@ forms:
       絶対に「結果はこのとおりです」「以下Markdown形式で回答します」「```markdown」などの前置き文は書かないでください。
       コールアウトの引用は自動で付与されるので不要です。
 
+  # 簡潔な回答(3〜6行)・地の文で書き戻す版
+  f_answer_plain: &f_answer_plain
+    front: |
+      あなたはObsidianのノート「{note_title}」内で呼び出されたアシスタントです。
+      以下はそのノートの該当箇所の抜粋です。
+    back: |
+      上記の文脈を踏まえて、聞かれたことについて簡潔に(目安3〜6行)日本語でまとめてください。
+      必要に応じて、ObsidianのMCPツールを用いてこのノートや関連する他のノートを参照(閲覧)しても構いませんが、このノート自体を編集・書き換えるツールは使わないでください。
+      回答はノートを直接編集するのではなく、単純にテキストとして返してください。ノートへの反映はこの後スクリプト側で自動的に行います。
+      Markdown形式で、前置きや後置きなしに本文のみを返してください。
+      絶対に「結果はこのとおりです」「以下Markdown形式で回答します」「```markdown」などの前置き文は書かないでください。
+      回答はコールアウト(`>` 引用)で囲まず、地の文としてそのまま載せます。引用やコールアウトは付けないでください。
+
 agents:
 
   "@PI":
     <<: [*default, *m_main, *d_quick, *f_answer]
+
+  # 最終結果をcalloutではなく地の文として書き戻すエージェント
+  # (処理中の表示は従来どおりcalloutで、最終結果で置き換える際に引用が外れる)
+  "@Plain":
+    <<: [*default, *m_main, *d_quick, *f_answer_plain]
+    plain_output: true
 
   "@Code":
     <<: [*default, *m_main, *d_normal, *f_code]
