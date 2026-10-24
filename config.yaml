@@ -33,13 +33,6 @@ default:
   # ここを省略すると環境変数 PI_CWD が使われる。
   cwd: /workspace
 
-  # 既定エージェント。ノート内で書かれたタグが解決できなかったときに使われる。
-  # agents のキーでも aliases の値でも書ける。ここを省略すると @PI を aliases に持つ
-  # エージェントが既定になり、それも無い場合は agents の最初のエージェントが使われる。
-  # 例えば "@Normal" に aliases: ["@PI"] と書くと、ノート内で @PI と書かれたものは
-  # @Normal が答える。
-  default_agent: "@PI"
-
 # model / thinking / provider を1回だけ定義して参照するためのアンカー。
 # ここがアンカーを使う唯一の場所である。app.py はこのセクションそのものを読まない。
 profiles:

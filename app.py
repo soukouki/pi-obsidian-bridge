@@ -105,8 +105,8 @@ def load_config() -> tuple[list[AgentConfig], AgentConfig]:
 
     戻り値: (エージェントリスト, 既定エージェント)
     優先度順: 明示的 @ タグ > エイリアス
-    既定エージェントは default_agent で指定した名前(agents のキーまたは aliases の値)。
-    未指定なら DEFAULT_ALIAS を持つエージェントが使われる。
+    既定エージェントは DEFAULT_ALIAS(@PI)をタグまたは aliases に持つエージェント。
+    見つからない場合は agents の最初のエージェントが使われる。
     """
     if not CONFIG_PATH.exists():
         log.warning("config.yaml が見つかりません: %s (デフォルト設定を使用)", CONFIG_PATH)
@@ -127,7 +127,6 @@ def load_config() -> tuple[list[AgentConfig], AgentConfig]:
     default_back = default_section.get("back") or DEFAULT_BACK
     default_plain = bool(default_section.get("plain_output", False))
     default_cwd = default_section.get("cwd") or PI_CWD
-    default_agent_name = default_section.get("default_agent")
 
     agents: list[AgentConfig] = []
     default_alias_holder: str | None = None
@@ -167,7 +166,7 @@ def load_config() -> tuple[list[AgentConfig], AgentConfig]:
         agents = _default_agents()
         return agents, agents[0]
 
-    # 既定エージェント: default_agent で指定した名前 > DEFAULT_ALIAS を持つエージェント > 最初のエージェント
+    # 既定エージェント: DEFAULT_ALIAS を持つエージェント > 最初のエージェント
     by_name: dict[str, AgentConfig] = {}
     for a in agents:
         by_name[a.tag] = a
@@ -175,14 +174,7 @@ def load_config() -> tuple[list[AgentConfig], AgentConfig]:
             by_name[alias] = a
 
     default_agent: AgentConfig | None = None
-    if default_agent_name:
-        default_agent = by_name.get(str(default_agent_name))
-        if default_agent is None:
-            log.warning(
-                "default_agent が見つかりません: %s (既定エイリアス %s を使用)",
-                default_agent_name, DEFAULT_ALIAS,
-            )
-    if default_agent is None and default_alias_holder is not None:
+    if default_alias_holder is not None:
         default_agent = by_name[default_alias_holder]
     if default_agent is None:
         default_agent = agents[0]
